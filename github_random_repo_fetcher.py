@@ -1,6 +1,4 @@
-import base64
 import os
-import random
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -10,7 +8,7 @@ import requests
 
 
 GITHUB_API = "https://api.github.com"
-DB_PATH = "github_repos.db"
+DB_PATH = "tools.db"
 TARGET_REPOS = 1000
 MIN_REMAINING_REQUESTS = 10
 MAX_SEARCH_ATTEMPTS = 20
@@ -38,17 +36,28 @@ def init_db(db_path: str = DB_PATH) -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS github_repos (
+            CREATE TABLE IF NOT EXISTS tools (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo_id INTEGER NOT NULL UNIQUE,
-                title TEXT NOT NULL,
+                github_id INTEGER NOT NULL UNIQUE,
+                name TEXT,
+                full_name TEXT,
+                owner TEXT,
+                description TEXT,
+                html_url TEXT,
+                homepage TEXT,
+                stars INTEGER,
+                forks INTEGER,
+                watchers INTEGER,
+                open_issues INTEGER,
                 language TEXT,
-                forks INTEGER NOT NULL,
-                stars INTEGER NOT NULL,
-                watching INTEGER NOT NULL,
-                readme TEXT,
-                url TEXT,
-                fetched_at TEXT NOT NULL
+                license TEXT,
+                archived INTEGER,
+                disabled INTEGER,
+                visibility TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                pushed_at TEXT,
+                default_branch TEXT
             )
             """
         )
@@ -96,7 +105,7 @@ def get_state(key: str, db_path: str = DB_PATH) -> Optional[str]:
 def load_existing_repo_ids(db_path: str = DB_PATH) -> Set[int]:
     conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute("SELECT repo_id FROM github_repos").fetchall()
+        rows = conn.execute("SELECT github_id FROM tools").fetchall()
         return {row[0] for row in rows}
     finally:
         conn.close()
@@ -105,7 +114,7 @@ def load_existing_repo_ids(db_path: str = DB_PATH) -> Set[int]:
 def count_saved_repos(db_path: str = DB_PATH) -> int:
     conn = sqlite3.connect(db_path)
     try:
-        row = conn.execute("SELECT COUNT(*) FROM github_repos").fetchone()
+        row = conn.execute("SELECT COUNT(*) FROM tools").fetchone()
         return int(row[0]) if row else 0
     finally:
         conn.close()
@@ -214,60 +223,34 @@ def fetch_repo_detail(owner: str, repo: str, db_path: str = DB_PATH) -> Dict[str
     return response.json()
 
 
-def fetch_readme(owner: str, repo: str, db_path: str = DB_PATH) -> str:
-    response = requests.get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/readme",
-        headers=github_headers(),
-        timeout=20,
-    )
-    update_rate_limit_state(response, db_path)
-
-    remaining = response.headers.get("X-RateLimit-Remaining")
-    reset_at = response.headers.get("X-RateLimit-Reset")
-    resource = response.headers.get("X-RateLimit-Resource", "core")
-
-    if response.status_code == 404:
-        return "README not found."
-
-    raise_for_rate_limit(response)
-
-    response.raise_for_status()
-
-    if remaining is not None and int(remaining) <= MIN_REMAINING_REQUESTS:
-        raise RateLimitReached(
-            int(reset_at) if reset_at else None,
-            f"GitHub {resource} rate limit is low ({remaining} remaining).",
-        )
-
-    data = response.json()
-    content = data.get("content", "")
-    encoding = data.get("encoding")
-
-    if encoding == "base64" and content:
-        try:
-            return base64.b64decode(content).decode("utf-8", errors="ignore")
-        except Exception:
-            return "README decode failed."
-    return "README content is not base64."
-
-
 def get_random_repo_info(existing_repo_ids: Set[int], db_path: str = DB_PATH) -> Dict[str, Any]:
     repo = pick_random_repo(existing_repo_ids, db_path=db_path)
     owner = repo["owner"]["login"]
     name = repo["name"]
     repo_detail = fetch_repo_detail(owner, name, db_path=db_path)
-    readme_text = fetch_readme(owner, name, db_path=db_path)
+    license_info = repo_detail.get("license") or {}
 
     return {
-        "repo_id": repo_detail["id"],
-        "title": repo_detail["full_name"],
-        "language": repo_detail.get("language") or "Unknown",
-        "forks": repo_detail.get("forks_count", 0),
+        "github_id": repo_detail["id"],
+        "name": repo_detail.get("name"),
+        "full_name": repo_detail.get("full_name"),
+        "owner": owner,
+        "description": repo_detail.get("description"),
+        "html_url": repo_detail.get("html_url"),
+        "homepage": repo_detail.get("homepage"),
         "stars": repo_detail.get("stargazers_count", 0),
-        "watching": repo_detail.get("subscribers_count", 0),
-        "readme": readme_text,
-        "url": repo_detail.get("html_url"),
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "forks": repo_detail.get("forks_count", 0),
+        "watchers": repo_detail.get("watchers_count", 0),
+        "open_issues": repo_detail.get("open_issues_count", 0),
+        "language": repo_detail.get("language") or "Unknown",
+        "license": license_info.get("name"),
+        "archived": int(bool(repo_detail.get("archived", False))),
+        "disabled": int(bool(repo_detail.get("disabled", False))),
+        "visibility": repo_detail.get("visibility"),
+        "created_at": repo_detail.get("created_at"),
+        "updated_at": repo_detail.get("updated_at"),
+        "pushed_at": repo_detail.get("pushed_at"),
+        "default_branch": repo_detail.get("default_branch"),
     }
 
 
@@ -276,20 +259,33 @@ def save_to_sqlite(repo_info: Dict[str, Any], db_path: str = DB_PATH) -> None:
     try:
         conn.execute(
             """
-            INSERT OR IGNORE INTO github_repos (
-                repo_id, title, language, forks, stars, watching, readme, url, fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO tools (
+                github_id, name, full_name, owner, description, html_url, homepage,
+                stars, forks, watchers, open_issues, language, license, archived,
+                disabled, visibility, created_at, updated_at, pushed_at, default_branch
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                repo_info["repo_id"],
-                repo_info["title"],
-                repo_info["language"],
-                repo_info["forks"],
+                repo_info["github_id"],
+                repo_info["name"],
+                repo_info["full_name"],
+                repo_info["owner"],
+                repo_info["description"],
+                repo_info["html_url"],
+                repo_info["homepage"],
                 repo_info["stars"],
-                repo_info["watching"],
-                repo_info["readme"],
-                repo_info["url"],
-                repo_info["fetched_at"],
+                repo_info["forks"],
+                repo_info["watchers"],
+                repo_info["open_issues"],
+                repo_info["language"],
+                repo_info["license"],
+                repo_info["archived"],
+                repo_info["disabled"],
+                repo_info["visibility"],
+                repo_info["created_at"],
+                repo_info["updated_at"],
+                repo_info["pushed_at"],
+                repo_info["default_branch"],
             ),
         )
         conn.commit()
@@ -318,17 +314,17 @@ def fetch_until_target(target_repos: int = TARGET_REPOS, db_path: str = DB_PATH)
     while saved_count < target_repos:
         try:
             repo_info = get_random_repo_info(existing_repo_ids, db_path=db_path)
-            if repo_info["repo_id"] in existing_repo_ids:
+            if repo_info["github_id"] in existing_repo_ids:
                 continue
 
             save_to_sqlite(repo_info, db_path=db_path)
-            existing_repo_ids.add(repo_info["repo_id"])
+            existing_repo_ids.add(repo_info["github_id"])
             saved_count += 1
             set_state("last_success_at", datetime.now(timezone.utc).isoformat(), db_path)
 
             print(
                 f"[{saved_count}/{target_repos}] "
-                f"Saved {repo_info['title']} | Stars: {repo_info['stars']} | {repo_info['url']}"
+                f"Saved {repo_info['full_name']} | Stars: {repo_info['stars']} | {repo_info['html_url']}"
             )
         except RateLimitReached as exc:
             reset_text = format_reset_time(exc.reset_at)
